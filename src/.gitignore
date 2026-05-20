@@ -1,0 +1,50 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Generated URL files (you may want to keep some, but ignore large ones)
+fontanka_urls/
+all_fontanka_urls.txt
+*.txt
+
+# Detector output
+saved_articles/
+report_*.json
+*.diff
+
+# Backup copies (as seen in your screenshot)
+*_copy.py
+*~ 
+*.bak
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# OS generated
+Thumbs.db
+
+.DS_Store

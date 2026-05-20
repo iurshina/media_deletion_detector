@@ -1,0 +1,16 @@
+[project]
+name = "russian-media-deletion-detector"
+version = "0.2.0"
+description = "Detect deleted or altered articles on Russian media sites using content-based comparison"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+    "trafilatura>=1.6.0",
+]
+
+[project.scripts]
+detect-deletions = "deletion_detector:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
