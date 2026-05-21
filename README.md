@@ -24,6 +24,16 @@ Automatically discover and archive deleted or altered articles from media sites 
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+### 2. Install project dependencies
+
+```bash
+uv sync
+```
+
+This installs `requests` and `trafilatura` (used for article-text extraction).
+Content-only comparison requires `trafilatura`; without it the detector falls
+back to full-page HTML comparison, which is noisy.
+
 ## Step 1: Fetch URLs from Wayback Machine
 
 The command you'll use:
@@ -37,8 +47,13 @@ uv run src/fetch_cdx_urls.py --domain www.fontanka.ru --from 2015 --to 2025 --ou
 - Saves each month's URLs into a separate text file under `fontanka_urls/`.
 - Files are named like `www_fontanka_ru_2015_01.txt`, `www_fontanka_ru_2015_02.txt`, etc.
 
-**Why per‑month?**  
+**Why per‑month?**
 Full‑year requests often time out (Fontanka 2015 alone had 165k+ URLs). Month splitting is reliable and lets you resume partial runs.
+
+**Robustness**:
+- **Resume** — months that already have a non‑empty output file are skipped, so you can interrupt and restart the run without losing progress.
+- **Retries** — 5 attempts per CDX request with 2 / 5 / 15 / 30 / 60 s backoff, 120 s timeout. The Wayback CDX endpoint frequently returns 504/timeouts even when `web.archive.org` itself is up, so long backoff is needed.
+- **Weekly fallback** — if all month‑level retries fail, the script automatically splits the month into ~7‑day windows and unions the results. Large months (e.g. Jan 2015) often only succeed at smaller window sizes.
 
 **Arguments**:
 
@@ -73,9 +88,16 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 50 --
 | `--urls-file` | Text file with one URL per line – **required** |
 | `--target` | Stop after this many `deleted` + `changed` (default 50) |
 | `--limit` | Max URLs to check (random sample) – omit to check all |
-| `--output-dir` | Where to save HTML/diff files (default `saved_articles`) |
-| `--delay` | Seconds between URL checks (default 1.0) |
+| `--output-dir` | Where to save HTML files (default `saved_articles`) |
+| `--workers` | Concurrent worker threads (default 8). Lower if Wayback rate-limits you. |
+| `--delay` | Per-task delay after each URL in seconds (default 0). Bump up if rate-limited. |
 | `--full-page` | Compare full HTML instead of extracted text (more false positives) |
+
+URLs are processed concurrently across `--workers` threads, sharing a pooled
+`requests.Session` so TLS handshakes are amortized. With 8 workers and a fast
+network this is roughly an order of magnitude faster than the sequential
+version. If you see `429`/`503` responses or `Connection refused`, drop
+`--workers` (e.g. `--workers 3 --delay 0.5`).
 
 ### Examples
 
@@ -91,16 +113,27 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 1000
 
 ## Output
 
-- **HTML files** – saved in `saved_articles/` (or your `--output-dir`).  
+- **HTML files** – saved in `saved_articles/` (or your `--output-dir`).
+  Each file is the archived snapshot HTML (with a few `<!-- ... -->` metadata
+  comments at the top: original URL, verdict, comparison mode, archive URL).
   Filename: `{verdict}_{mode}_{timestamp}_{sanitized_url}.html`
+- **JSON report** – `report_<YYYYMMDD_HHMMSS>.json` in the working directory.
+  Contains the run parameters and a `deleted_changed_articles` array with the
+  URL, verdict, live status, archive timestamp/URL, saved file path, and the
+  live/archive content digests for every finding.
 
 ## Understanding Results
 
 | Verdict    | Meaning |
 |------------|---------|
 | `deleted`  | Live page returns 404, but the Wayback Machine has a copy. |
-| `changed`  | Live page returns 200, but the extracted article text differs from the archive. A `.diff` file shows what changed. |
-| (unchanged) | No action – text matches archive (or page never archived). |
+| `changed`  | Live page returns 200, but the extracted article text differs from the latest 200 archive snapshot. |
+| (unchanged) | No action – text matches archive (or page never archived, or extraction failed on one side). |
+
+Archive snapshots are fetched with the Wayback `id_` modifier
+(`/web/<timestamp>id_/<url>`) so the toolbar/banner Wayback normally injects
+is not part of the comparison. Extracted text is NFKC-normalized and
+whitespace-collapsed before hashing to avoid spurious diffs.
 
 ## Full Workflow Example
 
@@ -117,5 +150,16 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 50 --
 # 4. Examine outputs
 ls saved_articles/
 cat report_*.json | jq '.deleted_changed_articles[].url'
-
 ```
+
+## Troubleshooting
+
+- **`Connection refused` / `Max retries exceeded` to `web.archive.org`** —
+  the Wayback cluster is unreachable from your network. Check
+  https://status.archive.org/ and confirm with
+  `curl -I --max-time 5 https://web.archive.org/`. The main `archive.org` host
+  can be reachable while the Wayback cluster is down; the CDX fetcher and the
+  detector both rely on the Wayback cluster.
+- **All findings are `changed`, no `deleted`** — make sure live HTTP errors are
+  reaching the detector (some sites return a 200 "Not found" page instead of a
+  real 404; those will never be flagged as deleted).

@@ -16,6 +16,9 @@ import requests
 import argparse
 import random
 import os
+import threading
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # Try to import trafilatura (optional but recommended)
@@ -28,19 +31,30 @@ except ImportError:
 
 # ------------------------- CONFIGURATION -------------------------
 USER_AGENT = "Mozilla/5.0 (compatible; DeletionDetector/1.0; research@example.com)"
-REQUEST_DELAY = 1.0          # seconds between each URL check
+REQUEST_DELAY = 0.0          # per-task delay; concurrency provides natural spacing
 CDX_API_URL = "https://web.archive.org/cdx/search/cdx"
 OUTPUT_DIR = "saved_articles"
+
+# Shared session — connection pooling cuts TLS handshake cost across all requests.
+# Adapter pool sized for the worker pool so concurrent workers don't serialize on the
+# default 10-connection pool.
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
+_adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
+PRINT_LOCK = threading.Lock()
 
 # ------------------------- TEXT EXTRACTION -------------------------
 def extract_text_from_html(html, url=""):
     """
-    Extract main article text from HTML using trafilatura.
-    Returns plain text string, or None if extraction fails.
+    Extract main article text from HTML using trafilatura, then normalize.
+    Returns normalized plain text, or None if extraction fails / yields too little.
+    Never falls back to raw HTML — that would defeat content-only comparison.
     """
     if not HAS_TRAFILATURA:
-        # Fallback: return raw HTML (will be hashed as full page)
-        return html
+        return None
     try:
         text = trafilatura.extract(
             html,
@@ -48,40 +62,43 @@ def extract_text_from_html(html, url=""):
             include_tables=False,
             include_images=False,
             include_formatting=False,
-            output_format="text"
+            output_format="text",
         )
-        if text and len(text.strip()) > 50:
-            return text.strip()
-        else:
-            # Fallback to raw HTML if extracted text is too short
-            return html
     except Exception:
-        return html
+        return None
+    if not text or len(text.strip()) < 50:
+        return None
+    text = unicodedata.normalize("NFKC", text)
+    text = " ".join(text.split())
+    return text
 
 def get_content_digest(html, content_only=True):
     """
-    Return SHA-1 digest of either extracted text or full HTML.
+    Return (SHA-1 digest, content bytes) of extracted text or full HTML.
+    Returns (None, None) if content-only extraction failed.
     """
-    if content_only and HAS_TRAFILATURA:
+    if content_only:
         text = extract_text_from_html(html)
-        # Use the extracted text (or fallback full HTML)
-        content = text.encode('utf-8')
+        if text is None:
+            return None, None
+        content = text.encode("utf-8")
     else:
-        content = html.encode('utf-8')
+        content = html.encode("utf-8")
     return hashlib.sha1(content).hexdigest().upper(), content
 
 # ------------------------- NETWORK HELPERS -------------------------
 def get_live_status(url, content_only=True):
-    """Fetch current live page, return (status_code, content_digest)."""
+    """Fetch current live page, return (status_code, content_digest, content_bytes).
+    On non-200 responses the digest/content are None but the status code is returned
+    so the caller can still detect 404s as deletions."""
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": USER_AGENT}, allow_redirects=True)
-        if resp.status_code == 200:
-            digest, content = get_content_digest(resp.text, content_only)
-        else:
-            digest = None
-        return resp.status_code, digest, content
+        resp = SESSION.get(url, timeout=15, allow_redirects=True)
     except Exception:
         return None, None, None
+    digest, content = None, None
+    if resp.status_code == 200:
+        digest, content = get_content_digest(resp.text, content_only)
+    return resp.status_code, digest, content
 
 def get_cdx_snapshots(url):
     """Fetch all snapshots for a URL from CDX API."""
@@ -92,7 +109,7 @@ def get_cdx_snapshots(url):
         "limit": 1000,
     }
     try:
-        resp = requests.get(CDX_API_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+        resp = SESSION.get(CDX_API_URL, params=params, timeout=15)
         if resp.status_code != 200:
             return []
         data = resp.json()
@@ -111,9 +128,12 @@ def get_cdx_snapshots(url):
         return []
 
 def fetch_archive_content(archive_url):
-    """Retrieve the HTML content from a Wayback snapshot."""
+    """Retrieve raw archived HTML using the `id_` modifier so the Wayback toolbar,
+    banner script, and rewritten URLs are not included — otherwise comparison would
+    pick up Wayback's own wrapper as 'changes'."""
+    raw_url = re.sub(r"(/web/\d{14})/", r"\1id_/", archive_url, count=1)
     try:
-        resp = requests.get(archive_url, timeout=20, headers={"User-Agent": USER_AGENT})
+        resp = SESSION.get(raw_url, timeout=20)
         if resp.status_code == 200:
             return resp.text
     except Exception:
@@ -164,21 +184,18 @@ def analyze_and_save(url, content_only):
     if not archive_html:
         return None, None, None
     
-    if content_only and HAS_TRAFILATURA:
-        archive_digest, archive_content = get_content_digest(archive_html, content_only=True)
-        # live_digest already computed with content_only
-    else:
-        # Use CDX's stored digest for full-page comparison (faster)
-        archive_digest, archive_content = latest_good["digest"]
-        # If we are in content-only mode but trafilatura missing, fall back to full page
-        if content_only and not HAS_TRAFILATURA:
-            archive_digest = get_content_digest(archive_html, content_only=False)
-    
+    archive_digest, archive_content = get_content_digest(archive_html, content_only=content_only)
+
     # Determine verdict
     verdict = None
     if live_code == 404:
         verdict = "deleted"
-    elif live_code == 200 and live_digest != archive_digest:
+    elif (
+        live_code == 200
+        and live_digest is not None
+        and archive_digest is not None
+        and live_digest != archive_digest
+    ):
         verdict = "changed"
         print(f"  [!] Content changed: live digest {live_digest} vs archive digest {archive_digest}")
     else:
@@ -202,25 +219,36 @@ def analyze_and_save(url, content_only):
     return verdict, metadata, saved_path
 
 # ------------------------- MAIN -------------------------
+def _process_one(idx, total, url, content_only, delay):
+    """Worker entry point: analyze one URL, optionally sleep, return result tuple."""
+    try:
+        verdict, metadata, saved_path = analyze_and_save(url, content_only)
+    except Exception as e:
+        return idx, url, None, None, None, e
+    if delay > 0:
+        time.sleep(delay)
+    return idx, url, verdict, metadata, saved_path, None
+
 def main():
     parser = argparse.ArgumentParser(description="Find and save deleted/changed articles using content-based comparison")
     parser.add_argument("--urls-file", required=True, help="Text file with one URL per line")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of URLs to check (random sample)")
     parser.add_argument("--target", type=int, default=50, help="Stop after finding this many deleted/changed articles")
     parser.add_argument("--output-dir", default="saved_articles", help="Directory to save HTML files")
-    parser.add_argument("--delay", type=float, default=1.0, help="Seconds between URL checks")
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent worker threads (default 8). Lower this if Wayback rate-limits you.")
+    parser.add_argument("--delay", type=float, default=0.0, help="Per-task delay after each URL (default 0). Bump up if rate-limited.")
     parser.add_argument("--full-page", action="store_true", help="Compare full HTML instead of extracted text (more false positives)")
     args = parser.parse_args()
-    
+
     content_only = not args.full_page
     if content_only and not HAS_TRAFILATURA:
         print("Warning: trafilatura not installed. Falling back to full-page comparison.", file=sys.stderr)
         content_only = False
-    
+
     global OUTPUT_DIR, REQUEST_DELAY
     OUTPUT_DIR = args.output_dir
     REQUEST_DELAY = args.delay
-    
+
     # --- Load URLs ---
     print(f"\n[Phase 1] Loading URLs from {args.urls_file}")
     try:
@@ -230,40 +258,53 @@ def main():
     except Exception as e:
         print(f"  [!] Error loading file: {e}", file=sys.stderr)
         sys.exit(1)
-    
+
     # --- Apply limit ---
     if args.limit and args.limit < len(all_urls):
         all_urls = random.sample(all_urls, args.limit)
         print(f"  [+] Randomly selected {len(all_urls)} URLs to check.")
     else:
         print(f"  [+] Will check all {len(all_urls)} URLs.")
-    
+
+    total = len(all_urls)
     print(f"\n[Phase 2] Comparison mode: {'content-only (extracted text)' if content_only else 'full-page HTML'}")
-    print(f"Target: {args.target} deleted/changed articles.\n")
-    
-    # --- Analysis loop ---
+    print(f"Workers: {args.workers}, per-task delay: {args.delay}s, target: {args.target} deleted/changed articles.\n")
+
+    # --- Analysis loop (concurrent) ---
     found_count = 0
     results = []
     checked = 0
-    
-    for i, url in enumerate(all_urls, 1):
-        if found_count >= args.target:
-            print(f"\n✅ Reached target of {args.target} deleted/changed articles. Stopping.")
-            break
-        
-        print(f"[{i}/{len(all_urls)}] Checking: {url[:80]}...")
-        verdict, metadata, saved_path = analyze_and_save(url, content_only)
-        checked += 1
-        
-        if verdict:
-            found_count += 1
-            results.append(metadata)
-            print(f"  🚨 {verdict.upper()} #{found_count} -> saved to {saved_path}")
-        else:
-            print("  ➖ Unchanged or no archive")
-        
-        time.sleep(REQUEST_DELAY)
-    
+    start_time = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(_process_one, i, total, url, content_only, args.delay): (i, url)
+            for i, url in enumerate(all_urls, 1)
+        }
+        try:
+            for fut in as_completed(futures):
+                idx, url, verdict, metadata, saved_path, err = fut.result()
+                checked += 1
+                with PRINT_LOCK:
+                    if err is not None:
+                        print(f"[{idx}/{total}] ⚠️  error: {url[:80]} — {err}", file=sys.stderr)
+                    elif verdict:
+                        found_count += 1
+                        results.append(metadata)
+                        print(f"[{idx}/{total}] 🚨 {verdict.upper()} #{found_count}: {url[:80]} -> {saved_path}")
+                    # Skip per-URL "unchanged" prints — they drown out signal with N workers.
+                if found_count >= args.target:
+                    print(f"\n✅ Reached target of {args.target}. Cancelling remaining work.")
+                    break
+        finally:
+            # Cancel queued-but-not-started futures; in-flight tasks finish on their own.
+            for f in futures:
+                f.cancel()
+
+    elapsed = time.monotonic() - start_time
+    rate = checked / elapsed if elapsed > 0 else 0.0
+    print(f"\n⏱  Checked {checked} URLs in {elapsed:.1f}s ({rate:.1f} URLs/s).")
+
     # --- Save report ---
     report = {
         "source_file": args.urls_file,
