@@ -113,27 +113,61 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 1000
 
 ## Output
 
-- **HTML files** – saved in `saved_articles/` (or your `--output-dir`).
-  Each file is the archived snapshot HTML (with a few `<!-- ... -->` metadata
-  comments at the top: original URL, verdict, comparison mode, archive URL).
-  Filename: `{verdict}_{mode}_{timestamp}_{sanitized_url}.html`
-- **JSON report** – `report_<YYYYMMDD_HHMMSS>.json` in the working directory.
-  Contains the run parameters and a `deleted_changed_articles` array with the
-  URL, verdict, live status, archive timestamp/URL, saved file path, and the
-  live/archive content digests for every finding.
+- **Per-finding JSON files** – one file per finding in `saved_articles/`
+  (or your `--output-dir`). Filename:
+  `{verdict}_{archive_timestamp}_{sanitized_url}.json`. Each file is
+  self-contained and includes both URLs and the article text from each side:
+
+  ```jsonc
+  {
+    "url": "https://www.fontanka.ru/...",
+    "verdict": "changed",          // or "deleted"
+    "comparison_mode": "content-only",
+    "archive": {
+      "url":       "https://web.archive.org/web/.../...",
+      "raw_url":   "https://web.archive.org/web/...id_/...",
+      "timestamp": "20150106065535",
+      "digest":    "ABCDEF...",
+      "text":      "# Headline\n\nParagraph...\n\n[link](https://...)"
+    },
+    "live": {
+      "url":         "https://www.fontanka.ru/...",
+      "status_code": 200,           // 404 for deleted
+      "fetched_at":  "2026-05-21T10:30:00",
+      "digest":      "...",
+      "text":        "..."          // null for deleted (live is 404)
+    }
+  }
+  ```
+
+  Article text is extracted with `trafilatura` in Markdown mode, so
+  hyperlinks are preserved as `[text](url)` and paragraph structure is kept —
+  ready for diffing or downstream analysis.
+- **Run-level JSON report** – `report_<YYYYMMDD_HHMMSS>.json` in the working
+  directory. Index of the run: parameters and a `deleted_changed_articles`
+  array with one entry per finding (URL, verdict, paths to the per-finding
+  JSON, digests, archive timestamp). Texts are NOT duplicated here — open
+  the per-finding files for those.
 
 ## Understanding Results
 
 | Verdict    | Meaning |
 |------------|---------|
-| `deleted`  | Live page returns 404, but the Wayback Machine has a copy. |
-| `changed`  | Live page returns 200, but the extracted article text differs from the latest 200 archive snapshot. |
+| `deleted`  | Live page returns 404, but the Wayback Machine has a copy. The archive's article text is saved in the JSON; `live.text` is `null`. |
+| `changed`  | Live page returns 200, but the extracted article text differs from the latest 200 archive snapshot. Both `archive.text` and `live.text` are saved. |
 | (unchanged) | No action – text matches archive (or page never archived, or extraction failed on one side). |
 
-Archive snapshots are fetched with the Wayback `id_` modifier
-(`/web/<timestamp>id_/<url>`) so the toolbar/banner Wayback normally injects
-is not part of the comparison. Extracted text is NFKC-normalized and
-whitespace-collapsed before hashing to avoid spurious diffs.
+How comparison works:
+
+- Archive snapshots are fetched with the Wayback `id_` modifier
+  (`/web/<timestamp>id_/<url>`) so the toolbar/banner Wayback normally
+  injects is not part of the comparison.
+- For the digest, extracted text is NFKC-normalized and whitespace-collapsed,
+  and **links/formatting are stripped** so that volatile URL parameters
+  (tracking tokens, session IDs) don't cause spurious `changed` verdicts.
+- For the saved evidence files, text is re-extracted as Markdown with
+  links + formatting preserved, so the human-readable text in the JSON is
+  richer than what's hashed.
 
 ## Full Workflow Example
 
