@@ -341,6 +341,8 @@ def main():
     results = []
     checked = 0
     start_time = time.monotonic()
+    last_heartbeat = start_time
+    HEARTBEAT_INTERVAL = 15.0  # seconds — reassures the user the script isn't stuck
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
@@ -359,6 +361,12 @@ def main():
                         results.append(metadata)
                         print(f"[{idx}/{total}] 🚨 {verdict.upper()} #{found_count}: {url[:80]} -> {saved_path}")
                     # Skip per-URL "unchanged" prints — they drown out signal with N workers.
+
+                    now = time.monotonic()
+                    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                        rate = checked / (now - start_time) if now > start_time else 0.0
+                        print(f"  ··· progress: {checked}/{total} checked, {found_count}/{args.target} found, {rate:.1f} URLs/s")
+                        last_heartbeat = now
                 if found_count >= args.target:
                     print(f"\n✅ Reached target of {args.target}. Cancelling remaining work.")
                     break
