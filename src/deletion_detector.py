@@ -18,7 +18,7 @@ import random
 import os
 import threading
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from datetime import datetime
 
 # Try to import trafilatura (optional but recommended)
@@ -304,6 +304,9 @@ def main():
     parser.add_argument("--workers", type=int, default=8, help="Concurrent worker threads (default 8). Lower this if Wayback rate-limits you.")
     parser.add_argument("--delay", type=float, default=0.0, help="Per-task delay after each URL (default 0). Bump up if rate-limited.")
     parser.add_argument("--full-page", action="store_true", help="Compare full HTML instead of extracted text (more false positives)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Don't skip URLs found in <output-dir>/.checked_urls.txt — re-process every URL. "
+                             "By default the detector records each completed URL and skips it on re-runs.")
     args = parser.parse_args()
 
     content_only = not args.full_page
@@ -314,6 +317,7 @@ def main():
     global OUTPUT_DIR, REQUEST_DELAY
     OUTPUT_DIR = args.output_dir
     REQUEST_DELAY = args.delay
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Load URLs ---
     print(f"\n[Phase 1] Loading URLs from {args.urls_file}")
@@ -325,7 +329,19 @@ def main():
         print(f"  [!] Error loading file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # --- Apply limit ---
+    # --- Resume: drop URLs already checked in a previous run ---
+    checked_file_path = os.path.join(args.output_dir, ".checked_urls.txt")
+    if not args.no_resume and os.path.exists(checked_file_path):
+        with open(checked_file_path, "r", encoding="utf-8") as f:
+            previously_checked = {line.strip() for line in f if line.strip()}
+        if previously_checked:
+            before = len(all_urls)
+            all_urls = [u for u in all_urls if u not in previously_checked]
+            print(f"  [+] Resume: {before - len(all_urls)} of {before} URLs already checked "
+                  f"(see {checked_file_path}); {len(all_urls)} remaining. "
+                  f"Pass --no-resume to redo them.")
+
+    # --- Apply limit (after resume filter, so the sample is over remaining URLs) ---
     if args.limit and args.limit < len(all_urls):
         all_urls = random.sample(all_urls, args.limit)
         print(f"  [+] Randomly selected {len(all_urls)} URLs to check.")
@@ -336,43 +352,88 @@ def main():
     print(f"\n[Phase 2] Comparison mode: {'content-only (extracted text)' if content_only else 'full-page HTML'}")
     print(f"Workers: {args.workers}, per-task delay: {args.delay}s, target: {args.target} deleted/changed articles.\n")
 
-    # --- Analysis loop (concurrent) ---
+    # --- Analysis loop (concurrent, sliding window) ---
     found_count = 0
     results = []
     checked = 0
     start_time = time.monotonic()
     last_heartbeat = start_time
     HEARTBEAT_INTERVAL = 15.0  # seconds — reassures the user the script isn't stuck
+    WINDOW = max(args.workers * 4, 16)  # max futures in flight at once
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(_process_one, i, total, url, content_only, args.delay): (i, url)
-            for i, url in enumerate(all_urls, 1)
-        }
+    def _submit_next(url_iter, inflight, executor):
+        """Pull the next URL from the iterator and submit it. Returns False on exhaustion."""
         try:
-            for fut in as_completed(futures):
-                idx, url, verdict, metadata, saved_path, err = fut.result()
-                checked += 1
-                with PRINT_LOCK:
-                    if err is not None:
-                        print(f"[{idx}/{total}] ⚠️  error: {url[:80]} — {err}", file=sys.stderr)
-                    elif verdict:
-                        found_count += 1
-                        results.append(metadata)
-                        print(f"[{idx}/{total}] 🚨 {verdict.upper()} #{found_count}: {url[:80]} -> {saved_path}")
-                    # Skip per-URL "unchanged" prints — they drown out signal with N workers.
+            i, url = next(url_iter)
+        except StopIteration:
+            return False
+        fut = executor.submit(_process_one, i, total, url, content_only, args.delay)
+        inflight[fut] = (i, url)
+        return True
 
-                    now = time.monotonic()
-                    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                        rate = checked / (now - start_time) if now > start_time else 0.0
-                        print(f"  ··· progress: {checked}/{total} checked, {found_count}/{args.target} found, {rate:.1f} URLs/s")
-                        last_heartbeat = now
-                if found_count >= args.target:
+    url_iter = iter(enumerate(all_urls, 1))
+    inflight = {}
+
+    # The checked-URLs file and the worker pool are both managed via context
+    # managers so they close cleanly on Ctrl-C or any unhandled exception.
+    with open(checked_file_path, "a", encoding="utf-8") as checked_fh, \
+         ThreadPoolExecutor(max_workers=args.workers) as executor:
+        checked_lock = threading.Lock()
+
+        def _record_checked(url):
+            with checked_lock:
+                checked_fh.write(url + "\n")
+                checked_fh.flush()
+
+        # Prime the window
+        for _ in range(WINDOW):
+            if not _submit_next(url_iter, inflight, executor):
+                break
+
+        try:
+            while inflight and found_count < args.target:
+                done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    inflight.pop(fut, None)
+                    idx, url, verdict, metadata, saved_path, err = fut.result()
+                    checked += 1
+                    if err is None:
+                        # Record on success even when verdict is None (i.e. "unchanged"
+                        # or "no archive available") so resume skips those too.
+                        # Transient errors are left out so they get retried next run.
+                        _record_checked(url)
+                    with PRINT_LOCK:
+                        if err is not None:
+                            print(f"[{idx}/{total}] ⚠️  error: {url[:80]} — {err}", file=sys.stderr)
+                        elif verdict:
+                            found_count += 1
+                            results.append(metadata)
+                            print(f"[{idx}/{total}] 🚨 {verdict.upper()} #{found_count}: {url[:80]} -> {saved_path}")
+                        # Per-URL "unchanged" prints intentionally omitted.
+
+                        now = time.monotonic()
+                        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                            rate = checked / (now - start_time) if now > start_time else 0.0
+                            print(
+                                f"  ··· progress: {checked}/{total} checked, "
+                                f"{found_count}/{args.target} found, "
+                                f"{rate:.1f} URLs/s, {len(inflight)} in-flight"
+                            )
+                            last_heartbeat = now
+
+                    if found_count >= args.target:
+                        break
+
+                    # Refill: keep the window full so workers stay busy.
+                    _submit_next(url_iter, inflight, executor)
+
+            if found_count >= args.target:
+                with PRINT_LOCK:
                     print(f"\n✅ Reached target of {args.target}. Cancelling remaining work.")
-                    break
         finally:
             # Cancel queued-but-not-started futures; in-flight tasks finish on their own.
-            for f in futures:
+            # The checked-URLs file is closed by its context manager.
+            for f in inflight:
                 f.cancel()
 
     elapsed = time.monotonic() - start_time

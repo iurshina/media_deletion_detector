@@ -92,6 +92,15 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 50 --
 | `--workers` | Concurrent worker threads (default 8). Lower if Wayback rate-limits you. |
 | `--delay` | Per-task delay after each URL in seconds (default 0). Bump up if rate-limited. |
 | `--full-page` | Compare full HTML instead of extracted text (more false positives) |
+| `--no-resume` | Don't skip URLs already in `<output-dir>/.checked_urls.txt` |
+
+**Resume support** is on by default. The detector records every URL it
+finishes (success, "unchanged", or "no archive available") into
+`<output-dir>/.checked_urls.txt`. On the next run those URLs are dropped
+from the pool before `--limit` is applied, so the random sample is drawn
+from URLs that haven't been seen yet. Transient errors are NOT recorded —
+they get retried next time. To force a fresh pass, pass `--no-resume` or
+delete the file.
 
 URLs are processed concurrently across `--workers` threads, sharing a pooled
 `requests.Session` so TLS handshakes are amortized. With 8 workers and a fast
@@ -185,6 +194,89 @@ uv run src/deletion_detector.py --urls-file all_fontanka_urls.txt --target 50 --
 ls saved_articles/
 cat report_*.json | jq '.deleted_changed_articles[].url'
 ```
+
+## Step 4 (optional): Cluster deleted articles by topic
+
+Once you have a pile of `deleted_*.json` files in `saved_articles/`, you can
+group them into topics with BGE-M3 embeddings + BERTopic, with Russian→English
+translation by Argos so the topic keywords are readable English while the
+original Russian is preserved alongside every article.
+
+### One-time setup
+
+```bash
+uv sync --extra cluster
+```
+
+This installs `sentence-transformers`, `bertopic`, `argostranslate`, and their
+transitive deps. Expect ~1–2 GB of installs plus ~2.3 GB for the BGE-M3 model
+the first time it runs, plus ~250 MB for the ru→en Argos pack (downloaded on
+first translation call).
+
+### Run
+
+```bash
+uv run src/cluster_topics.py --input-dir saved_articles --output-dir clusters_output
+```
+
+The default `--max-seq-length 512 --batch-size 8` is the safe CPU setting and
+is already on by default. If you still hit `RuntimeError: Invalid buffer size`
+(BGE-M3 supports an 8192-token context — the attention matrix at that length
+is ~63 GB), shrink further:
+
+```bash
+# Last-ditch for very memory-constrained machines
+uv run src/cluster_topics.py \
+  --input-dir saved_articles --output-dir clusters_output \
+  --max-seq-length 256 --batch-size 2
+```
+
+On a GPU you can go the other way for higher-quality embeddings:
+
+```bash
+uv run src/cluster_topics.py \
+  --input-dir saved_articles --output-dir clusters_output \
+  --max-seq-length 2048 --batch-size 32
+```
+
+**Arguments**:
+
+| Argument | Description |
+|----------|-------------|
+| `--input-dir` | Where `deleted_*.json` files live (default `saved_articles`) |
+| `--output-dir` | Where to write `clusters.json`, `clusters.csv`, `summary.txt`, `translation_cache.json` (default `clusters_output`) |
+| `--model` | sentence-transformers model id (default `BAAI/bge-m3`) |
+| `--min-topic-size` | Smallest cluster BERTopic will keep (default 10) |
+| `--max-seq-length` | Max tokens per article for embedding (default 512). See memory note above. |
+| `--batch-size` | Embedding batch size (default 8). |
+| `--from-lang` / `--to-lang` | Argos language codes (defaults `ru` / `en`) |
+| `--no-translate` | Skip translation; use Russian text for both embedding and topic labels |
+
+### Output
+
+- `clusters_output/clusters.json` — full payload: per-article rows with both
+  `text_ru` and `text_en` (the RU↔EN mapping), the assigned `cluster`, and
+  per-cluster blocks with English keywords, a human-readable `description`,
+  and `representative_articles` (the 3 articles closest to each cluster's
+  centroid, each with a 300-char EN+RU snippet). Outliers go to cluster `-1`.
+- `clusters_output/summary.txt` — flat human-readable digest, sorted by
+  cluster size: keywords, representative URLs, and a snippet per cluster.
+  Best for a first look.
+- `clusters_output/clusters.csv` — one row per article (cluster, url,
+  timestamp, source_file, English-text preview), sorted by cluster — easy to
+  pivot in a spreadsheet.
+- `clusters_output/translation_cache.json` — SHA-1-keyed translation cache,
+  so re-running doesn't re-translate the same articles.
+
+### Why embed Russian but label in English?
+
+- BGE-M3 is multilingual; embedding the original Russian preserves nuance
+  that would be lost through translation.
+- The c-TF-IDF topic labels need to be readable, so they're computed over
+  the English translations.
+- Keywords are diversified with **MaximalMarginalRelevance** (BERTopic's
+  representation model) so labels avoid near-duplicates like
+  "protest / protests / protester".
 
 ## Troubleshooting
 

@@ -1,6 +1,6 @@
 [project]
 name = "russian-media-deletion-detector"
-version = "0.2.0"
+version = "0.3.0"
 description = "Detect deleted or altered articles on Russian media sites using content-based comparison"
 requires-python = ">=3.8"
 dependencies = [
@@ -8,8 +8,20 @@ dependencies = [
     "trafilatura>=1.6.0",
 ]
 
+[project.optional-dependencies]
+# Clustering / topic detection pipeline. Heavy (~3-4 GB after model download).
+# Install with: uv sync --extra cluster
+cluster = [
+    "sentence-transformers>=2.2.0",
+    "bertopic>=0.16.0",
+    "argostranslate>=1.9.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+]
+
 [project.scripts]
 detect-deletions = "deletion_detector:main"
+cluster-topics = "cluster_topics:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
